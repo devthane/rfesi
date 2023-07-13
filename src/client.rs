@@ -1,17 +1,19 @@
 //! Main logic
 
 use crate::{groups::*, prelude::*};
+use async_stream::try_stream;
 use base64::engine::{general_purpose::STANDARD as base64, Engine};
+use futures_core::stream::Stream;
 use log::{debug, error};
 use rand::{distributions::Alphanumeric, Rng};
 use reqwest::{
     header::{self, HeaderMap, HeaderValue},
-    Client, Method,
+    Client, Method, Request,
 };
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -41,7 +43,7 @@ struct RefreshTokenAuthenticateResponse {
 /// Which base URL to start with - the public URL for unauthenticated
 /// calls, or the authenticated URL for making calls to endpoints that
 /// require an access token.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum RequestType {
     /// Endpoints that do not require authentication
     Public,
@@ -373,15 +375,123 @@ impl Esi {
         query: Option<&[(&str, &str)]>,
         body: Option<&str>,
     ) -> EsiResult<T> {
+        let req = Esi::make_request(self, method, request_type, endpoint, query, body)?;
+        let resp = self.client.execute(req).await?;
+        if !resp.status().is_success() {
+            error!(
+                "Got status {} when requesting data from {}{}",
+                resp.status(),
+                BASE_URL,
+                endpoint,
+            );
+            return Err(EsiError::InvalidStatusCode(resp.status().as_u16()));
+        }
+        let text = resp.text().await?;
+        let data: T = serde_json::from_str(&text)?;
+        Ok(data)
+    }
+
+    /// Make a paginated request to ESI.
+    ///
+    /// This is mainly used as the underlying function for this
+    /// library when making calls to ESI; the other functions that
+    /// you should primarily be using contain more functionality,
+    /// including matching endpoint with deserialization struct,
+    /// evaluating & replacing URL parameters, etc.
+    /// ```
+    pub async fn stream_query<'a, T: DeserializeOwned + Debug + 'a>(
+        &'a self,
+        method: &'a str,
+        request_type: RequestType,
+        endpoint: String,
+        query: Option<&'a [(&str, &str)]>,
+        body: Option<&'a str>,
+    ) -> impl Stream<Item = EsiResult<T>> + 'a {
+        let esi = self.clone();
+        let mut query = if let Some(q) = query {
+            q.to_owned()
+                .iter()
+                .map(|kv| (kv.0.to_string(), kv.1.to_string()))
+                .collect()
+        } else {
+            vec![("page".to_string(), "1".to_string())]
+        };
+
+        let result = try_stream! {
+            let mut page = 1;
+            let mut last_page: Option<u64> = None;
+            let mut items: VecDeque<T> = VecDeque::new();
+
+            loop {
+                if items.len() > 0 {
+                    yield items.pop_front().unwrap();
+                    continue;
+                }
+                if let Some(lp) = last_page {
+                    if lp < page {
+                        return;
+                    }
+                }
+
+                query = query.into_iter().map(|kv| {
+                    if kv.0 == "page".to_owned() {
+                        (kv.0, page.to_string())
+                    } else {
+                        (kv.0, kv.1)
+                    }
+                }).collect();
+                let q: Vec<(&str, &str)> = query.iter().map(|kv| (kv.0.as_str(), kv.1.as_str())).collect();
+
+                let req = Esi::make_request(&esi, method, request_type.clone(), &endpoint, Some(q.as_slice()), body)?;
+                let resp = esi.client.execute(req).await?;
+                let headers = resp.headers().clone();
+                if !resp.status().is_success() {
+                    error!(
+                        "Got status {} when requesting data from {}{}",
+                        resp.status(),
+                        BASE_URL,
+                        endpoint,
+                    );
+                    Err(EsiError::InvalidStatusCode(resp.status().as_u16()))?;
+                }
+                let text = resp.text().await?;
+                items = serde_json::from_str(&text)?;
+
+                page += 1;
+                if last_page.is_none() {
+                    last_page = if headers.contains_key("x-pages") {
+                        let lp = str::parse(headers.get("x-pages").unwrap().to_str().unwrap()).unwrap();
+                        if lp == 1 {
+                            return
+                        }
+                        Some(lp)
+                    } else {
+                        Some(1)
+                    }
+                }
+            }
+        };
+
+        result
+    }
+
+    fn make_request(
+        esi: &Esi,
+        method: &str,
+        request_type: RequestType,
+        endpoint: &str,
+        query: Option<&[(&str, &str)]>,
+        body: Option<&str>,
+    ) -> Result<Request, EsiError> {
         debug!(
             "Making {:?} {} request to {} with query: {:?}",
             request_type, method, endpoint, query
         );
         if request_type == RequestType::Authenticated {
-            if self.access_token.is_none() {
+            if esi.access_token.is_none() {
                 return Err(EsiError::MissingAuthentication);
             }
-            if self.access_expiration.unwrap() < current_time_millis()? {
+            if esi.access_expiration.unwrap() < current_time_millis()? {
                 return Err(EsiError::AccessTokenExpired);
             }
         }
@@ -390,7 +500,7 @@ impl Esi {
             // The 'user-agent' and 'content-type' headers are set in the default headers
             // from the builder, so all that's required here is to set the authorization
             // header, if present.
-            match &self.access_token {
+            match &esi.access_token {
                 Some(at) => {
                     map.insert(
                         header::AUTHORIZATION,
@@ -401,29 +511,16 @@ impl Esi {
             }
             map
         };
-        let url = format!("{BASE_URL}{endpoint}");
-        let mut req_builder = self
+        let mut req_builder = esi
             .client
-            .request(Method::from_str(method)?, &url)
+            .request(Method::from_str(method)?, &format!("{BASE_URL}{endpoint}"))
             .headers(headers)
             .query(query.unwrap_or(&[]));
         req_builder = match body {
             Some(b) => req_builder.body(b.to_owned()),
             None => req_builder,
         };
-        let req = req_builder.build()?;
-        let resp = self.client.execute(req).await?;
-        if !resp.status().is_success() {
-            error!(
-                "Got status {} when requesting data from {}",
-                resp.status(),
-                url
-            );
-            return Err(EsiError::InvalidStatusCode(resp.status().as_u16()));
-        }
-        let text = resp.text().await?;
-        let data: T = serde_json::from_str(&text)?;
-        Ok(data)
+        Ok(req_builder.build()?)
     }
 
     /// Resolve an `operationId` to a URL path utilizing the Swagger spec.

@@ -55,6 +55,7 @@
 
 #![deny(clippy::all)]
 #![deny(missing_docs)]
+#![feature(async_closure)]
 
 #[macro_use]
 mod macros;

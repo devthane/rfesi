@@ -41,12 +41,12 @@ pub struct AssetName {
 }
 
 impl<'a> AssetsGroup<'a> {
-    api_get!(
+    api_stream!(
         /// Get a character's assets.
         get_character_assets,
         "get_characters_character_id_assets",
         RequestType::Authenticated,
-        Vec<Asset>,
+        Asset,
         (character_id: u64) => "{character_id}"
     );
 
